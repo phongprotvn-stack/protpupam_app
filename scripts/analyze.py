@@ -1,7 +1,7 @@
 """
 PROT PUPAM — TikTok Video Analyzer
 Chạy trên GitHub Actions, kiểm tra video mới từ @bobubammm,
-phân tích bằng Gemini 2.5 Flash, lưu vào Firestore.
+phân tích bằng Gemini 2.5 Flash, lưu vào Firestore (REST API).
 
 Cách dùng local:
   pip install -r scripts/requirements.txt
@@ -9,7 +9,8 @@ Cách dùng local:
   python scripts/analyze.py
 
 Biến môi trường cần:
-  - FIREBASE_SERVICE_ACCOUNT_JSON: service account key (JSON string)
+  - FIREBASE_API_KEY: Firebase Web App API key (từ firebaseConfig)
+  - FIREBASE_PROJECT_ID: Firebase project ID (mặc định: protpupam)
   - GEMINI_API_KEY: Google AI Studio API key
   - TIKTOK_USERNAME: bobubammm (mặc định)
   - TELEGRAM_BOT_TOKEN (optional): cho notification
@@ -23,51 +24,113 @@ import tempfile
 import shutil
 import time
 import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+import datetime
 from pathlib import Path
-
-# Global cache cho Firestore client
-FIRESTORE_MODULE = None
 
 # ─── Config ────────────────────────────────────────────────
 TIKTOK_USERNAME = os.environ.get('TIKTOK_USERNAME', 'bobubammm')
 PROFILE_URL = f'https://www.tiktok.com/@{TIKTOK_USERNAME}'
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-FIREBASE_SA_JSON = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON', '')
+FIREBASE_API_KEY = os.environ.get('FIREBASE_API_KEY', '')
+FIREBASE_PROJECT_ID = os.environ.get('FIREBASE_PROJECT_ID', 'protpupam')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-MAX_VIDEOS_PER_RUN = int(os.environ.get('MAX_VIDEOS_PER_RUN', '3'))  # Tối đa phân tích mỗi lần chạy
-MIN_INTERVAL_HOURS = int(os.environ.get('MIN_INTERVAL_HOURS', '1'))   # Chỉ phân tích video cũ hơn 1h (tránh video chưa có đủ metadata)
+MAX_VIDEOS_PER_RUN = int(os.environ.get('MAX_VIDEOS_PER_RUN', '3'))
+MIN_INTERVAL_HOURS = int(os.environ.get('MIN_INTERVAL_HOURS', '1'))
 
 print(f"🔍 Target: {PROFILE_URL}")
 
 
-# ─── 1. Init Firebase ──────────────────────────────────────
+# ─── 1. Init Firestore REST client ─────────────────────────
+FIRESTORE_BASE_URL = None  # Set by init_firestore()
+
 def init_firestore():
-    """Khởi tạo Firestore client từ service account JSON."""
-    global FIRESTORE_MODULE
-    try:
-        import firebase_admin
-        from firebase_admin import credentials
-        import firebase_admin.firestore as _fs
-        FIRESTORE_MODULE = _fs
-    except ImportError:
-        print("❌ firebase-admin chưa cài. Chạy: pip install firebase-admin")
-        sys.exit(1)
-
-    if not FIREBASE_SA_JSON:
-        print("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON chưa set. Bỏ qua Firestore.")
+    """Init Firestore via REST API (no service account needed)."""
+    global FIRESTORE_BASE_URL
+    if not FIREBASE_API_KEY:
+        print("⚠️  FIREBASE_API_KEY chưa set. Bỏ qua Firestore.")
         return None
+    FIRESTORE_BASE_URL = (
+        f"https://firestore.googleapis.com/v1/"
+        f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents"
+    )
+    print(f"✅ Firestore REST ready — project: {FIREBASE_PROJECT_ID}")
+    return True
 
+
+def _fs_list(collection):
+    """GET documents from a collection."""
+    url = f"{FIRESTORE_BASE_URL}/{collection}?key={FIREBASE_API_KEY}"
     try:
-        sa_dict = json.loads(FIREBASE_SA_JSON)
-        cred = credentials.Certificate(sa_dict)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("✅ Firebase Firestore connected")
-        return db
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return data.get('documents', [])
     except Exception as e:
-        print(f"❌ Firebase init error: {e}")
-        return None
+        print(f"  ⚠️  Firestore list error: {e}")
+        return []
+
+
+def _fs_set(collection, doc_id, doc_dict):
+    """Create/overwrite a document. Returns True on success."""
+    fields = _to_fs_fields(doc_dict)
+    body = {"fields": fields}
+    url = (
+        f"{FIRESTORE_BASE_URL}/{collection}"
+        f"?documentId={doc_id}&key={FIREBASE_API_KEY}"
+    )
+    data = json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(
+        url, data=data,
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return True
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        print(f"  ❌ Firestore POST error {e.code}: {body}")
+        return False
+    except Exception as e:
+        print(f"  ❌ Firestore error: {e}")
+        return False
+
+
+def _to_fs_fields(d):
+    """Convert Python dict to Firestore REST field format."""
+    fields = {}
+    for k, v in d.items():
+        if v is None:
+            fields[k] = {"nullValue": None}
+        elif isinstance(v, bool):
+            fields[k] = {"booleanValue": v}
+        elif isinstance(v, int):
+            fields[k] = {"integerValue": str(v)}
+        elif isinstance(v, float):
+            fields[k] = {"doubleValue": v}
+        elif isinstance(v, dict):
+            fields[k] = {"mapValue": {"fields": _to_fs_fields(v)}}
+        elif isinstance(v, str):
+            fields[k] = {"stringValue": v}
+        else:
+            fields[k] = {"stringValue": str(v)}
+    return fields
+
+
+def _fs_get_existing_ids(collection):
+    """Return set of all document IDs (or videoId field values) in collection."""
+    docs = _fs_list(collection)
+    ids = set()
+    for doc in docs:
+        f = doc.get('fields', {})
+        vid = f.get('videoId', {}).get('stringValue', '')
+        did = f.get('id', {}).get('stringValue', '')
+        ids.add(str(vid) if vid else str(did) if did else doc.get('name', '').split('/')[-1])
+    return ids
 
 
 # ─── 2. Check new videos via yt-dlp ───────────────────────
@@ -75,7 +138,6 @@ def check_ytdlp():
     """Dùng yt-dlp --flat-playlist --dump-json để lấy danh sách video."""
     print(f"\n📥 Đang check TikTok bằng yt-dlp...")
 
-    # Kiểm tra yt-dlp có sẵn không
     if not shutil.which('yt-dlp') and not shutil.which('yt-dlp.exe'):
         print("⚠️  yt-dlp chưa cài. Thử cài qua pip...")
         subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'yt-dlp'], check=False)
@@ -85,11 +147,11 @@ def check_ytdlp():
 
     cmd = [
         'yt-dlp',
-        '--flat-playlist',          # Chỉ lấy metadata, không download
-        '--dump-json',              # Xuất JSON
+        '--flat-playlist',
+        '--dump-json',
         '--no-warnings',
-        '--extractor-args', 'tiktok:api=web',  # Dùng web API
-        '--playlist-end', '20',     # Lấy 20 video gần nhất
+        '--extractor-args', 'tiktok:api=web',
+        '--playlist-end', '20',
         PROFILE_URL,
     ]
 
@@ -97,7 +159,6 @@ def check_ytdlp():
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             print(f"⚠️  yt-dlp stderr: {result.stderr[:500]}")
-            # Thử lại với mobile API
             cmd[cmd.index('--extractor-args') + 1] = 'tiktok:api=app'
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
@@ -139,18 +200,7 @@ def find_new_videos(db, fetched_videos):
     if not db or not fetched_videos:
         return fetched_videos
 
-    existing_ids = set()
-    try:
-        docs = db.collection('videos').where('source', '==', 'tiktok').stream()
-        for doc in docs:
-            data = doc.to_dict()
-            # Chấp nhận cả 'id' và 'videoId'
-            vid = data.get('videoId') or data.get('id') or doc.id
-            existing_ids.add(str(vid))
-    except Exception as e:
-        print(f"⚠️  Lỗi đọc Firestore: {e}")
-        return fetched_videos
-
+    existing_ids = _fs_get_existing_ids('videos')
     new_videos = [v for v in fetched_videos if v['id'] not in existing_ids]
     print(f"🆕 Video mới: {len(new_videos)} (trong {len(fetched_videos)} fetched)")
     return new_videos
@@ -163,7 +213,6 @@ def download_and_extract(video_id, duration):
     temp_dir = tempfile.mkdtemp(prefix='protpupam_')
     video_path = os.path.join(temp_dir, f'{video_id}.mp4')
 
-    # Download
     print(f"  ⬇️  Downloading video {video_id}...")
     dl_cmd = [
         'yt-dlp',
@@ -191,7 +240,7 @@ def download_and_extract(video_id, duration):
     print(f"  🖼️  Extracting frames...")
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_path,
-        '-vf', 'fps=1/3',          # 1 frame mỗi 3 giây
+        '-vf', 'fps=1/3',
         '-q:v', '2',
         '-y',
         os.path.join(frame_dir, 'frame_%03d.jpg'),
@@ -204,7 +253,6 @@ def download_and_extract(video_id, duration):
     except Exception as e:
         print(f"  ⚠️  FFmpeg error: {e}")
 
-    # Extract audio
     audio_path = os.path.join(temp_dir, 'audio.mp3')
     audio_cmd = [
         'ffmpeg', '-i', video_path,
@@ -237,7 +285,6 @@ def analyze_with_gemini(frames, audio_path, duration):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('models/gemini-2.5-flash-002')
 
-    # Chuẩn bị prompt
     prompt = """You are analyzing a TikTok video from the creator "Bò Bụ Bẫm" (a Vietnamese female creator).
 Analyze the video frames and return ONLY a JSON object (no markdown, no explanation) with these fields:
 
@@ -251,7 +298,7 @@ Analyze the video frames and return ONLY a JSON object (no markdown, no explanat
   "location": "specific location if identifiable (in Vietnamese: 'phòng ngủ', 'phòng khách', 'quán cafe', 'nhà hàng', 'công viên', 'đường phố', 'biển', 'phòng gym', 'không rõ')",
   "emotion": "in Vietnamese: 'vui vẻ', 'cười', 'bình thường', 'buồn', 'ngạc nhiên', 'khóc', 'không rõ'",
   "musicMood": "music mood: 'vui', 'buồn', 'sôi động', 'nhẹ nhàng', 'lo-fi', 'không rõ'",
-  "peopleCount": number of people visible (number),
+  "peopleCount": "number of people visible (number as string)",
   "hasPet": "yes or no",
   "petType": "if hasPet, type in Vietnamese: 'mèo', 'chó', 'khác', 'không có'",
   "indoorOutdoor": "in Vietnamese: 'trong nhà' or 'ngoài trời'",
@@ -267,10 +314,8 @@ Analyze the video frames and return ONLY a JSON object (no markdown, no explanat
 
 Analyze carefully based on ALL frames provided. If unsure about any field, use the Vietnamese phrase 'không rõ'."""
 
-    # Upload frames
     content_parts = [prompt]
 
-    # Giới hạn số frames gửi đi (tối đa 8 frame)
     selected_frames = frames
     if len(frames) > 8:
         step = len(frames) / 8
@@ -289,7 +334,7 @@ Analyze carefully based on ALL frames provided. If unsure about any field, use t
         response = model.generate_content(content_parts, request_options={'timeout': 120})
         text = response.text.strip()
 
-        # Clean response (remove markdown code blocks)
+        # Clean response
         if text.startswith('```'):
             text = text.split('\n', 1)[1] if '\n' in text else text
         if text.endswith('```'):
@@ -309,13 +354,14 @@ Analyze carefully based on ALL frames provided. If unsure about any field, use t
         return None
 
 
-# ─── 6. Save to Firestore ──────────────────────────────────
+# ─── 6. Save to Firestore (REST) ──────────────────────────────
 def save_to_firestore(db, video_info, analysis):
-    """Lưu kết quả phân tích vào Firestore."""
-    global FIRESTORE_MODULE
+    """Lưu kết quả phân tích vào Firestore qua REST API."""
     if not db:
         print("  ⚠️  No Firestore, skip save")
         return False
+
+    now = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
     doc_data = {
         'id': video_info['id'],
@@ -330,21 +376,18 @@ def save_to_firestore(db, video_info, analysis):
         'duration': video_info.get('duration', 0),
         'source': 'tiktok',
         'viewed': False,
-        'createdAt': FIRESTORE_MODULE.SERVER_TIMESTAMP if FIRESTORE_MODULE else None,
-        'fetchedAt': FIRESTORE_MODULE.SERVER_TIMESTAMP if FIRESTORE_MODULE else None,
+        'createdAt': now,
+        'fetchedAt': now,
     }
 
     if analysis:
         doc_data['analysis'] = analysis
-        doc_data['analyzedAt'] = FIRESTORE_MODULE.SERVER_TIMESTAMP if FIRESTORE_MODULE else None
+        doc_data['analyzedAt'] = now
 
-    try:
-        db.collection('videos').document(video_info['id']).set(doc_data)
+    ok = _fs_set('videos', video_info['id'], doc_data)
+    if ok:
         print(f"  ✅ Saved to Firestore: {video_info['id']}")
-        return True
-    except Exception as e:
-        print(f"  ❌ Firestore save error: {e}")
-        return False
+    return ok
 
 
 # ─── 7. Telegram Notification ──────────────────────────────
@@ -374,7 +417,6 @@ def main():
     fetched = check_ytdlp()
     if not fetched:
         print("⚠️  Không lấy được video nào từ TikTok.")
-        # Nếu có Firestore, chỉ cập nhật
         if db:
             print("✅ Firestore sẵn sàng, chờ lần chạy sau có dữ liệu mới.")
         return
@@ -392,19 +434,15 @@ def main():
         print(f"\n{'='*50}")
         print(f"📹 Video: {video['id']} — {video.get('caption', '')[:80]}")
 
-        # Download + extract frames
         duration = video.get('duration', 30)
         frames, audio_path, temp_dir = download_and_extract(video['id'], duration)
 
-        # Analyze
         analysis = None
         if frames:
             analysis = analyze_with_gemini(frames, audio_path, duration)
 
-        # Save
         save_to_firestore(db, video, analysis)
 
-        # Notify
         if analysis:
             msg = (
                 f"🔴 <b>Bò Bụ Bẫm vừa đăng video mới!</b>\n"
@@ -416,11 +454,9 @@ def main():
             )
             send_telegram(msg)
 
-        # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
         processed += 1
 
-        # Delay giữa các video để tránh rate limit
         if processed < len(new_videos[:MAX_VIDEOS_PER_RUN]):
             time.sleep(5)
 

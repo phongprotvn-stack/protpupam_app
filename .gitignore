@@ -7,4 +7,7 @@ dist
 .firebaserc
 firebase-debug.log
 
-.vercel
+|.vercel
+|protpupam-sa.json
+|scripts/__pycache__/
+|*.pyc
