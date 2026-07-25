@@ -1,4 +1,3 @@
 yt-dlp>=2024.0
 google-generativeai>=0.8.0
 requests>=2.31.0
-// Trigger deploy Sat, Jul 25, 2026 10:22:50 PM
